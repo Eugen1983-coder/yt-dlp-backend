@@ -1,8 +1,29 @@
 from flask import Flask, request, jsonify
 from yt_dlp import YoutubeDL
 import threading
+import os
+import logging
 
 app = Flask(__name__)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configuration constants
+COOKIES_PATH = '/storage/BA73-022B/yt-dlp-backend/cookies/cookies.txt'
+DOWNLOAD_DIR = './downloads/'
+
+def get_common_ydl_opts():
+    opts = {
+        'cookiefile': COOKIES_PATH,
+        'quiet': True,
+        'no_warnings': True,
+    }
+    if not os.path.exists(COOKIES_PATH):
+        logger.warning(f"Cookie file not found at {COOKIES_PATH}, proceeding without cookies")
+        del opts['cookiefile']
+    return opts
 
 @app.route('/info', methods=['POST'])
 def video_info():
@@ -12,15 +33,12 @@ def video_info():
         return jsonify({'status': 'error', 'message': 'No URL provided'}), 400
 
     ydl_opts = {
-        'format': 'bestvideo+bestaudio/best',  # best video + audio or fallback best
+        **get_common_ydl_opts(),
+        'format': 'bestvideo+bestaudio/best',
         'skip_download': True,
-        'quiet': True,
-        'no_warnings': True,
         'writesubtitles': True,
         'writeautomaticsub': True,
         'allsubtitles': True,
-        'forcejson': True,
-        'simulate': True,
         'noplaylist': True,
     }
 
@@ -28,54 +46,52 @@ def video_info():
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
 
-            # Extract detailed formats info
-            formats = info.get('formats', [])
             detailed_formats = []
-            for f in formats:
+            for f in info.get('formats', []):
                 detailed_formats.append({
                     'format_id': f.get('format_id'),
                     'ext': f.get('ext'),
-                    'acodec': f.get('acodec'),
+                    'resolution': f.get('resolution'),
+                    'filesize': f.get('filesize') or f.get('filesize_approx'),
                     'vcodec': f.get('vcodec'),
-                    'format_note': f.get('format_note'),
-                    'fps': f.get('fps'),
-                    'width': f.get('width'),
-                    'height': f.get('height'),
-                    'tbr': f.get('tbr'),  # total bitrate
-                    'filesize': f.get('filesize'),
+                    'acodec': f.get('acodec'),
                     'url': f.get('url'),
-                    'protocol': f.get('protocol'),
-                    'quality': f.get('quality'),
-                    'audio_channels': f.get('audio_channels'),
-                    'language': f.get('language'),
                 })
 
-            # Prepare a cleaner response with key info
             response = {
                 'id': info.get('id'),
                 'title': info.get('title'),
                 'uploader': info.get('uploader'),
                 'duration': info.get('duration'),
-                'view_count': info.get('view_count'),
-                'like_count': info.get('like_count'),
-                'dislike_count': info.get('dislike_count'),
-                'description': info.get('description'),
                 'thumbnail': info.get('thumbnail'),
-                'webpage_url': info.get('webpage_url'),
+                'description': (info.get('description') or '')[:500] + "...",
                 'formats': detailed_formats,
                 'subtitles': info.get('subtitles'),
-                'automatic_captions': info.get('automatic_captions'),
                 'chapters': info.get('chapters'),
             }
 
         return jsonify({'status': 'success', 'info': response})
     except Exception as e:
+        logger.error(f"Error fetching info: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-def download_in_background(url, output_path):
-    ydl_opts = {'outtmpl': output_path + '%(title)s.%(ext)s'}
-    with YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+def download_task(url, output_path):
+    try:
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
+
+        ydl_opts = {
+            **get_common_ydl_opts(),
+            'format': 'bestvideo+bestaudio/best',
+            'outtmpl': os.path.join(output_path, '%(title)s.%(ext)s'),
+            'merge_output_format': 'mp4',
+        }
+
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        logger.info(f"Download completed for: {url}")
+    except Exception as e:
+        logger.error(f"Download failed for {url}: {str(e)}")
 
 @app.route('/download', methods=['POST'])
 def download_video():
@@ -84,11 +100,14 @@ def download_video():
     if not url:
         return jsonify({'status': 'error', 'message': 'No URL provided'}), 400
 
-    threading.Thread(target=download_in_background, args=(url, './downloads/')).start()
+    threading.Thread(target=download_task, args=(url, DOWNLOAD_DIR)).start()
 
-    return jsonify({'status': 'success', 'message': 'Download started'})
+    return jsonify({
+        'status': 'success',
+        'message': 'Download started in background',
+        'target_dir': DOWNLOAD_DIR
+    })
 
 if __name__ == '__main__':
-    import os
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=False)
