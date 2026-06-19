@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration constants
-COOKIES_PATH = '/storage/BA73-022B/yt-dlp-backend/cookies/cookies.txt'
+COOKIES_PATH = '/data/data/com.termux/files/home/yt-dlp-backend/cookies/cookies.txt'
 DOWNLOAD_DIR = './downloads/'
 
 def get_common_ydl_opts():
