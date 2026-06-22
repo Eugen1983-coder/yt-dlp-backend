@@ -8,15 +8,27 @@ import io
 import random
 import requests
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, send_file
+import datetime
 
 app = Flask(__name__)
 
 # Set environment variable for yt-dlp JS runtime
 os.environ['YT_DLP_JS_RUNTIME'] = 'deno'
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG, filename='app.log', format='%(asctime)s %(levelname)s:%(message)s')
+# Configure logging to file and console
+LOG_FILE = 'app.log'
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s %(levelname)s:%(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+app.logger = logger
 
 # Path to store decoded YouTube cookies inside container
 DECODED_COOKIES_PATH = '/app/youtube_cookies.txt'
@@ -24,9 +36,12 @@ DECODED_COOKIES_PATH = '/app/youtube_cookies.txt'
 # Decode the base64-encoded cookie file from environment variable at startup
 cookie_b64 = os.getenv('YOUTUBE_COOKIES_B64')
 if cookie_b64:
-    with open(DECODED_COOKIES_PATH, 'wb') as f:
-        f.write(base64.b64decode(cookie_b64))
-    app.logger.info("Decoded cookies saved successfully.")
+    try:
+        with open(DECODED_COOKIES_PATH, 'wb') as f:
+            f.write(base64.b64decode(cookie_b64))
+        app.logger.info("Decoded cookies saved successfully.")
+    except Exception as e:
+        app.logger.error(f"Failed to decode and save cookies: {e}")
 else:
     app.logger.warning("YOUTUBE_COOKIES_B64 environment variable is not set. Some features may not work.")
 
@@ -39,7 +54,41 @@ tasks = {}
 # List to hold working proxies
 working_proxies = []
 
-# Fetch free proxies from ProxyScrape
+# Proxy log file path inside project directory
+PROXY_LOG_PATH = os.path.join(os.getcwd(), 'proxy.log')
+
+# --- Proxy Testing and Logging ---
+
+def log_proxy_result(proxy, success, error_msg=None):
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    status = 'SUCCESS' if success else 'FAILURE'
+    log_line = f"{timestamp} - {proxy} - {status}"
+    if error_msg:
+        log_line += f" - {str(error_msg)[:50]}"
+    with open(PROXY_LOG_PATH, 'a') as log_file:
+        log_file.write(log_line + "\n")
+
+def test_proxy(proxy):
+    proxies = {
+        'http': f'http://{proxy}',
+        'https': f'http://{proxy}',
+    }
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+    }
+    try:
+        response = requests.get('https://www.youtube.com', proxies=proxies, headers=headers, timeout=10)
+        if response.status_code == 200:
+            log_proxy_result(proxy, True)
+            app.logger.debug(f"Proxy {proxy} is working.")
+            return True
+        else:
+            log_proxy_result(proxy, False, f"Status code: {response.status_code}")
+    except Exception as e:
+        log_proxy_result(proxy, False, e)
+        app.logger.debug(f"Proxy {proxy} failed: {e}")
+    return False
+
 def fetch_proxies():
     url = 'https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all'
     try:
@@ -51,34 +100,31 @@ def fetch_proxies():
         app.logger.error(f"Failed to fetch proxies: {e}")
         return []
 
-# Test if a proxy is working by making a request to Google
-def test_proxy(proxy):
-    proxies = {
-        'http': f'http://{proxy}',
-        'https': f'http://{proxy}',
-    }
-    try:
-        response = requests.get('https://www.google.com', proxies=proxies, timeout=5)
-        if response.status_code == 200:
-            app.logger.debug(f"Proxy {proxy} is working.")
-            return True
-    except Exception as e:
-        app.logger.debug(f"Proxy {proxy} failed: {e}")
-    return False
-
-# Initialize proxies on startup
 def initialize_proxies():
     global working_proxies
     proxies = fetch_proxies()
     working_proxies = []
-    for proxy in proxies:
-        if test_proxy(proxy):
-            working_proxies.append(proxy)
-    app.logger.info(f"{len(working_proxies)} proxies are working and ready for use.")
 
-# Run yt-dlp to extract video info as JSON with optional proxy
+    # Clear previous proxy log
+    try:
+        open(PROXY_LOG_PATH, 'w').close()
+    except Exception as e:
+        app.logger.error(f"Failed to clear proxy log: {e}")
+
+    # Use ThreadPoolExecutor for faster proxy testing
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        results = executor.map(test_proxy, proxies)
+        for proxy, is_working in zip(proxies, results):
+            if is_working:
+                working_proxies.append(proxy)
+
+    app.logger.info(f"{len(working_proxies)} proxies are working and ready for use.")
+    app.logger.info(f"Proxy test log saved to: {PROXY_LOG_PATH}")
+
+# --- yt-dlp Command Wrappers ---
+
 def run_yt_dlp_info(url, cookies_path=DECODED_COOKIES_PATH, use_remote_components=True, proxy=None):
-    cmd = ['yt-dlp', '--no-warnings', '-v']  # verbose logging
+    cmd = ['yt-dlp', '--no-warnings', '-v']
     if use_remote_components:
         cmd += ['--remote-components', 'ejs:github']
     if cookies_path and os.path.exists(cookies_path):
@@ -101,7 +147,6 @@ def run_yt_dlp_info(url, cookies_path=DECODED_COOKIES_PATH, use_remote_component
         app.logger.error(f"yt-dlp info exception: {e}")
         return {'status': 'error', 'message': str(e)}
 
-# Background worker to download video using yt-dlp with optional proxy
 def download_worker(task_id, url, output_path, cookies_path, use_remote_components, proxy=None):
     tasks[task_id]['status'] = 'downloading'
     if not os.path.exists(output_path):
@@ -121,16 +166,26 @@ def download_worker(task_id, url, output_path, cookies_path, use_remote_componen
     ]
 
     app.logger.debug(f"Running yt-dlp download command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        tasks[task_id]['status'] = 'completed'
-        app.logger.info(f"Download completed for task {task_id}")
-    else:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode == 0:
+            tasks[task_id]['status'] = 'completed'
+            app.logger.info(f"Download completed for task {task_id}")
+        else:
+            tasks[task_id]['status'] = 'failed'
+            tasks[task_id]['error'] = result.stderr
+            app.logger.error(f"Download failed for task {task_id}: {result.stderr}")
+    except subprocess.TimeoutExpired:
         tasks[task_id]['status'] = 'failed'
-        tasks[task_id]['error'] = result.stderr
-        app.logger.error(f"Download failed for task {task_id}: {result.stderr}")
+        tasks[task_id]['error'] = 'Download timed out'
+        app.logger.error(f"Download timed out for task {task_id}")
+    except Exception as e:
+        tasks[task_id]['status'] = 'failed'
+        tasks[task_id]['error'] = str(e)
+        app.logger.error(f"Download exception for task {task_id}: {e}")
 
-# API endpoint to get video info JSON
+# --- Flask API Endpoints ---
+
 @app.route('/info', methods=['POST'])
 def video_info():
     data = request.get_json(force=True) or {}
@@ -141,14 +196,12 @@ def video_info():
     use_remote_components = data.get('use_remote_components', True)
     proxy = data.get('proxy')
 
-    # If no proxy provided, rotate from working proxies
     if not proxy and working_proxies:
         proxy = random.choice(working_proxies)
 
     response = run_yt_dlp_info(url, DECODED_COOKIES_PATH, use_remote_components, proxy)
     return jsonify(response), (200 if response['status'] == 'success' else 500)
 
-# API endpoint to start video download in background
 @app.route('/download', methods=['POST'])
 def download_video():
     data = request.get_json(force=True) or {}
@@ -173,7 +226,6 @@ def download_video():
 
     return jsonify({'status': 'success', 'task_id': task_id})
 
-# API endpoint to get download task status
 @app.route('/status/<task_id>', methods=['GET'])
 def get_status(task_id):
     task = tasks.get(task_id)
@@ -181,7 +233,6 @@ def get_status(task_id):
         return jsonify({'error': 'Task not found'}), 404
     return jsonify(task)
 
-# API endpoint to download extracted video info JSON as a file
 @app.route('/download_info', methods=['POST'])
 def download_info():
     data = request.get_json(force=True) or {}
@@ -189,11 +240,13 @@ def download_info():
     if not url:
         return jsonify({'error': 'URL is required'}), 400
 
+    use_remote_components = data.get('use_remote_components', True)
     proxy = data.get('proxy')
+
     if not proxy and working_proxies:
         proxy = random.choice(working_proxies)
 
-    info = run_yt_dlp_info(url, DECODED_COOKIES_PATH, proxy=proxy)
+    info = run_yt_dlp_info(url, DECODED_COOKIES_PATH, use_remote_components, proxy)
     if info['status'] != 'success':
         return jsonify(info), 500
 
@@ -210,8 +263,6 @@ def download_info():
     )
 
 if __name__ == '__main__':
-    # Initialize proxies on startup
     initialize_proxies()
-
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
