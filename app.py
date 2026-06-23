@@ -9,7 +9,7 @@ import random
 import requests
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, abort
 import datetime
 
 app = Flask(__name__)
@@ -18,7 +18,7 @@ app = Flask(__name__)
 os.environ['YT_DLP_JS_RUNTIME'] = 'deno'
 
 # Configure logging to file and console
-LOG_FILE = 'app.log'
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app.log')
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s %(levelname)s:%(message)s',
@@ -30,6 +30,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 app.logger = logger
 
+# Read the LOG_DOWNLOAD_TOKEN from environment variables (set by Render)
+LOG_DOWNLOAD_TOKEN = os.getenv('LOG_DOWNLOAD_TOKEN')
+
 # Path to store decoded YouTube cookies inside container
 DECODED_COOKIES_PATH = '/app/youtube_cookies.txt'
 
@@ -37,6 +40,8 @@ DECODED_COOKIES_PATH = '/app/youtube_cookies.txt'
 cookie_b64 = os.getenv('YOUTUBE_COOKIES_B64')
 if cookie_b64:
     try:
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(DECODED_COOKIES_PATH), exist_ok=True)
         with open(DECODED_COOKIES_PATH, 'wb') as f:
             f.write(base64.b64decode(cookie_b64))
         app.logger.info("Decoded cookies saved successfully.")
@@ -261,6 +266,35 @@ def download_info():
         download_name='video_info.json',
         mimetype='application/json'
     )
+
+# --- New endpoint for downloading app.log securely ---
+
+@app.route('/download_log', methods=['GET'])
+def download_log():
+    # Simple token authentication via query parameter or header
+    token = request.args.get('token') or request.headers.get('X-Log-Token')
+    if not LOG_DOWNLOAD_TOKEN:
+        app.logger.error("LOG_DOWNLOAD_TOKEN environment variable is not set.")
+        abort(500, description="Server configuration error: LOG_DOWNLOAD_TOKEN not set")
+
+    if token != LOG_DOWNLOAD_TOKEN:
+        app.logger.warning(f"Unauthorized log download attempt with token: {token}")
+        abort(403, description="Forbidden: Invalid or missing token")
+
+    if not os.path.exists(LOG_FILE):
+        app.logger.error("Log file not found for download")
+        return jsonify({'error': 'Log file not found'}), 404
+
+    try:
+        return send_file(
+            LOG_FILE,
+            as_attachment=True,
+            download_name='app.log',
+            mimetype='text/plain'
+        )
+    except Exception as e:
+        app.logger.error(f"Error sending log file: {e}")
+        return jsonify({'error': 'Failed to send log file'}), 500
 
 if __name__ == '__main__':
     initialize_proxies()
